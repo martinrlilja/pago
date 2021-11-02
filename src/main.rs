@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::{
     collections::{BTreeMap as Map, BTreeSet as Set},
     io::Write,
+    time::Duration,
 };
 use structopt::StructOpt;
 use termion::{color, style};
@@ -25,15 +26,7 @@ struct Opt {
     domains: Vec<Name>,
 }
 
-#[derive(Clone, Debug, Default)]
-struct DomainNameservers {
-    nameservers: Set<Name>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct RecordDomains {
-    domains: Set<Name>,
-}
+const QUERY_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -49,31 +42,65 @@ async fn main() -> Result<()> {
         }
     });
 
+    let mut domain_soa: Map<Name, Name> = Map::new();
+    let mut domain_soa_queried: Set<Name> = Set::new();
+    let mut domains = opt.domains.clone();
+
+    while let Some(name) = domains.pop() {
+        if !domain_soa_queried.insert(name.clone()) {
+            continue;
+        }
+
+        let response = client
+            .query(name.clone(), DNSClass::IN, RecordType::SOA)
+            .await?;
+        tokio::time::sleep(QUERY_TIMEOUT).await;
+
+        for answer in response.answers() {
+            if let RData::SOA(ref soa) = *answer.rdata() {
+                domain_soa.insert(answer.name().clone(), soa.mname().clone());
+            }
+        }
+
+        let parent = name.base_name();
+        if !parent.is_root() {
+            domains.push(parent);
+        }
+    }
+
     let mut nameservers: Map<Name, Set<Name>> = Map::new();
+    let mut domains: Map<Name, Set<Name>> = Map::new();
+    let mut records: Map<RData, Set<Name>> = Map::new();
 
     for name in opt.domains {
         let response = client
             .query(name.clone(), DNSClass::IN, RecordType::NS)
             .await?;
-        for answers in response.answers() {
-            if let RData::NS(ref nameserver) = *answers.rdata() {
-                nameservers
-                    .entry(nameserver.clone())
-                    .or_default()
-                    .insert(name.clone());
+        tokio::time::sleep(QUERY_TIMEOUT).await;
+
+        for answer in response.answers() {
+            match *answer.rdata() {
+                RData::CNAME(ref domain) => {
+                    domains.entry(answer.name().clone()).or_default();
+                    records.entry(RData::CNAME(domain.clone()))
+                        .or_default()
+                        .insert(answer.name().clone());
+                }
+                RData::NS(ref nameserver) => {
+                    nameservers
+                        .entry(nameserver.clone())
+                        .or_default()
+                        .insert(answer.name().clone());
+                    domains.entry(answer.name().clone())
+                        .or_default()
+                        .insert(nameserver.clone());
+                }
+                _ => continue,
             }
         }
     }
 
-    let mut domains: Map<Name, DomainNameservers> = Map::new();
-    let mut records: Map<RData, RecordDomains> = Map::new();
-
     for (nameserver, ns_domains) in nameservers.iter() {
-        for domain in ns_domains {
-            let domain_nameservers = domains.entry(domain.clone()).or_default();
-            domain_nameservers.nameservers.insert(nameserver.clone());
-        }
-
         let ns_str = nameserver.to_ascii();
         let addrs = tokio::net::lookup_host((ns_str.as_str(), 53))
             .await?
@@ -102,16 +129,16 @@ async fn main() -> Result<()> {
             let response_aaaa = client
                 .query(domain.clone(), DNSClass::IN, RecordType::AAAA)
                 .await?;
-
-            for answer in response_a
+            let responses = response_a
                 .answers()
                 .iter()
-                .chain(response_aaaa.answers().iter())
-            {
+                .chain(response_aaaa.answers().iter());
+            tokio::time::sleep(QUERY_TIMEOUT).await;
+
+            for answer in responses {
                 match answer.rdata() {
                     record @ (RData::A(_) | RData::AAAA(_) | RData::CNAME(_)) => {
-                        let record = records.entry(record.clone()).or_default();
-                        record.domains.insert(domain.clone());
+                        records.entry(record.clone()).or_default().insert(domain.clone());
                     }
                     _ => continue,
                 }
@@ -133,13 +160,29 @@ async fn main() -> Result<()> {
         };
 
         let mut common_nameservers: Map<Name, (usize, Set<Name>)> = Map::new();
-        for domain in record_domains.domains.iter() {
+        for domain in record_domains.iter() {
             let nameservers = domains.get(domain).unwrap();
-            for nameserver in nameservers.nameservers.iter() {
+            for nameserver in nameservers {
                 let (nameserver_count, domains) =
                     common_nameservers.entry(nameserver.clone()).or_default();
                 *nameserver_count += 1;
                 domains.insert(domain.clone());
+            }
+
+            if nameservers.is_empty() {
+                // Our nameservers are somewhere else, so add the SOA as the nameserver.
+                let mut base_name = domain.clone();
+                while !base_name.is_root() {
+                    if let Some(soa) = domain_soa.get(&base_name) {
+                        let (nameserver_count, domains) =
+                            common_nameservers.entry(soa.clone()).or_default();
+                        *nameserver_count += 1;
+                        domains.insert(domain.clone());
+                        break;
+                    }
+                    base_name = base_name.base_name();
+                }
+
             }
         }
 
